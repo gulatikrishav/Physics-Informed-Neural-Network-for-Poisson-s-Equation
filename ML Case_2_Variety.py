@@ -24,10 +24,6 @@ print("Device:", device)
 # ==============================================================================
 # PART 1: NETWORK DEFINITION
 # ==============================================================================
-# THIS IS JUST THE BLUEPRINT — not where learning happens.
-# Think of this like drawing the structure of the network before anything gets built.
-# The actual learning happens later in the training loop (Part 6).
-#
 # Architecture: 2 → 50 → 50 → 50 → 50 → 1
 # - 1 input layer (takes x,y coordinates)
 # - 3 hidden layers (learn increasingly complex patterns)
@@ -118,7 +114,7 @@ def sample_boundary(n_points_per_edge, device=device):
 # PART 3: DYNAMIC PROBLEM DEFINITION (SYMPY -> TORCH)
 # ==============================================================================
 
-# ProblemConfig is just a container — no math happens here.
+# ProblemConfig is just a container - a class
 # It bundles the three things any PDE problem needs into one neat package:
 #   1. u_true  — what is the true solution? (used after training to check accuracy)
 #   2. f_source — what is the right hand side of ∇²u = f? (used in interior loss)
@@ -135,10 +131,6 @@ class ProblemConfig:
 
 
 def create_problem_from_expression(expression_str, name="Custom"):
-    # This is the heart of the refactor — SymPy does the calculus automatically.
-    # In the original code, adding a new u(x,y) required manually computing
-    # the Laplacian by hand. Here, SymPy does it for you.
-    #
     # Full pipeline: String → SymPy (calculus) → NumPy (numbers) → PyTorch (training)
     # Each library hands off to the next because each does something the others can't:
     #   SymPy  — does symbolic calculus (can't work with data arrays)
@@ -262,13 +254,6 @@ def choose_problem():
 
 def compute_laplacian(u, x, y):
     # Computes ∇²u = ∂²u/∂x² + ∂²u/∂y² on the NETWORK'S OUTPUT using autodiff.
-    # This is different from the SymPy Laplacian — SymPy computed the Laplacian
-    # of the true solution symbolically. This computes the Laplacian of whatever
-    # the network predicted, numerically, so we can compare the two.
-    #
-    # requires_grad=True on the input points (set back in sample_interior) is
-    # what makes this possible — PyTorch tracked those values through the network
-    # so it can differentiate backwards through them now.
 
     # First derivatives ∂u/∂x and ∂u/∂y
     # grad_outputs=ones_like needed because u is a vector (one value per point),
@@ -296,21 +281,17 @@ def compute_laplacian(u, x, y):
 
 def compute_interior_loss(model, problem, n_interior):
     x_interior, y_interior = sample_interior(n_interior, device=device)
-
-    # Feed points through the PINN network (the blueprint from Part 1)
-    # This is where that structure actually gets used — called thousands of times
     u_pred = model(x_interior, y_interior)
+    p_x = torch.autograd.grad(u_pred, x_interior, grad_outputs=torch.ones_like(u_pred), create_graph=True)[0]
+    p_y = torch.autograd.grad(u_pred, y_interior, grad_outputs=torch.ones_like(u_pred), create_graph=True)[0]
 
-    # Compute Laplacian of the network's prediction
-    laplacian_u = compute_laplacian(u_pred, x_interior, y_interior)
-
-    # Get what the Laplacian SHOULD be (auto-derived by SymPy for chosen function)
+#  CHANGED ||∇p||² = (∂p/∂x)² + (∂p/∂y)² — squared length of the gradient at each point
+    grad_norm_sq = p_x ** 2 + p_y ** 2
+ # CHANGED f*p — source term multiplied by network prediction at each interior point
     f_val = problem.f_source(x_interior, y_interior)
-
-    # Residual = how badly the network is violating the PDE at these points
-    residual = laplacian_u - f_val
-    return torch.mean(residual ** 2)
-
+    f_times_p = f_val * u_pred
+    half_function = 0.5 * grad_norm_sq + f_times_p
+    return torch.mean(half_function)
 
 def compute_boundary_loss(model, problem, n_per_edge):
     x_boundary, y_boundary = sample_boundary(n_per_edge, device=device)
@@ -333,13 +314,69 @@ def compute_total_loss(model, problem, n_interior, n_per_edge, lambda_bc):
     # are easier to enforce and the extra weight helps the network learn them quickly
     return li + lambda_bc * lb, li, lb
 
+def evaluate_laplacian(model, problem, n_test=100):
+    x_test = torch.linspace(0, 1, n_test, device=device)
+    y_test = torch.linspace(0, 1, n_test, device=device)
+    X, Y = torch.meshgrid(x_test, y_test, indexing="ij")
+
+    X_flat = X.reshape(-1, 1).requires_grad_(True)
+    Y_flat = Y.reshape(-1, 1).requires_grad_(True)
+
+    # Forward pass
+    U_pred_flat = model(X_flat, Y_flat)
+
+    # Compute Laplacian of prediction
+    lap_pred_flat = compute_laplacian(U_pred_flat, X_flat, Y_flat)
+
+    # True Laplacian from SymPy-derived source
+    f_true_flat = problem.f_source(X_flat, Y_flat)
+
+    lap_pred = lap_pred_flat.reshape(n_test, n_test)
+    f_true = f_true_flat.reshape(n_test, n_test)
+
+    return {
+        "X": X.detach().cpu(),
+        "Y": Y.detach().cpu(),
+        "lap_pred": lap_pred.detach().cpu(),
+        "lap_true": f_true.detach().cpu(),
+        "lap_error": (lap_pred - f_true).detach().cpu()
+    }
+
+def plot_laplacian(results, problem_label=""):
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    X = results["X"].numpy()
+    Y = results["Y"].numpy()
+    lap_pred = results["lap_pred"].numpy()
+    lap_true = results["lap_true"].numpy()
+    lap_error = np.abs(results["lap_error"].numpy())
+
+    fig = plt.figure(figsize=(18, 5))
+
+    # True Laplacian
+    ax1 = fig.add_subplot(1, 3, 1, projection="3d")
+    surf1 = ax1.plot_surface(X, Y, lap_true, cmap="viridis", edgecolor="none")
+    ax1.set_title("True Laplacian (f)")
+    fig.colorbar(surf1, ax=ax1, shrink=0.5)
+
+    # Predicted Laplacian
+    ax2 = fig.add_subplot(1, 3, 2, projection="3d")
+    surf2 = ax2.plot_surface(X, Y, lap_pred, cmap="viridis", edgecolor="none")
+    ax2.set_title("PINN Laplacian")
+    fig.colorbar(surf2, ax=ax2, shrink=0.5)
+
+    # Error
+    ax3 = fig.add_subplot(1, 3, 3, projection="3d")
+    surf3 = ax3.plot_surface(X, Y, lap_error, cmap="hot", edgecolor="none")
+    ax3.set_title("|Laplacian Error|")
+    fig.colorbar(surf3, ax=ax3, shrink=0.5)
+
+    plt.tight_layout()
+    plt.show()
 
 # ==============================================================================
 # PART 6: TRAINING
 # ==============================================================================
-# This is where the actual learning happens — everything above was just setup.
-# The training loop is identical regardless of which problem was chosen.
-# That's the payoff of the ProblemConfig abstraction — swap the problem, not the loop.
 
 keyname, problem = choose_problem()
 
@@ -350,10 +387,10 @@ model = PINN().to(device)
 # lr (learning rate) controls step size: too big = overshoots, too small = slow.
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-n_epochs = 5000   # Number of training iterations
+n_epochs = 5000    # Number of training iterations
 n_interior = 1000  # Random interior points per epoch
 n_per_edge = 250   # Random boundary points per edge (total = 4×250 = 1000)
-lambda_bc = 10.0   # Boundary loss weight
+lambda_bc = 1000.0  # CHANGED Boundary loss weight
 
 print("\nStarting training...")
 print(f"Network parameters: {sum(p.numel() for p in model.parameters())}")
@@ -387,13 +424,12 @@ for epoch in range(1, n_epochs + 1):
 print("-" * 70)
 print("Training complete!")
 
-
+lap_results = evaluate_laplacian(model, problem, n_test=100)
+plot_laplacian(lap_results, problem_label=keyname)
 # ==============================================================================
 # PART 7: EVALUATION AND VISUALIZATION
 # ==============================================================================
 # This is the FIRST TIME we compare against the true solution u_true.
-# During training the network never saw it — it only used physics checks.
-# Now we finally measure how well satisfying those physics checks worked.
 
 def evaluate_accuracy(model, problem, n_test=100):
     # Unlike training (random points), evaluation uses a clean uniform 100×100 grid
@@ -449,11 +485,6 @@ def print_metrics_table(results):
 
 
 def plot_results(results, problem_label=""):
-    # 2×3 grid of plots:
-    # Top row: 3D surface plots — True Solution | PINN Prediction | Absolute Error
-    # Bottom row: same three things viewed from above as 2D heatmaps
-    # If the network did well, true solution and prediction should look nearly identical.
-    # The error plot shows exactly where the network struggled most.
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     X = results["X"].numpy()
